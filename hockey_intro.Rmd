@@ -1,0 +1,386 @@
+---
+title: "intro_hockey"
+author: "JMeerse"
+date: "`r Sys.Date()`"
+output: html_document
+---
+#packages
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+
+library(Rtools)
+install.packages("Rtools")
+# try this first
+install.packages("hockeyR")
+install.packages("devtools")
+library(devtools)
+devtools::install_github("danmorse314/hockeyR")
+install.packages("sportyR")
+install.packages("ggtext")
+install.packages("hrbrthemes")
+install.packages("ggExtra")
+```
+#libraries
+```{r}
+library(tidyverse)
+library(janitor)
+library(hockeyR)
+library(sportyR)
+library(gt)
+library(gtExtras)
+library(ggtext)
+library(hrbrthemes)
+library(ggExtra)
+```
+#data and cleaning
+```{r}
+pbp <- scrape_day(day = "2021-02-27")
+roster <- get_rosters(team = "all", season = 2021)
+
+powerplay <- pbp %>% 
+  # create a variable to determine the length of the event and a variable to specify the PP team
+  mutate(length = lead(period_seconds) - period_seconds,
+         PP_team = case_when((event_team_type == "home" & strength_state == "5v4") |
+                               (event_team_type == "away" & strength_state == "4v5") ~ home_abbreviation,
+                             TRUE ~ away_abbreviation)) %>% 
+  filter(strength_state %in% c("5v4","4v5") & (length > 0 | event_type %in% c("GOAL","SHOT"))) %>% 
+  select(event_type, event_team_abbr, event_team_type, home_abbreviation, away_abbreviation, PP_team,
+         length, strength_state, x:y_fixed, home_on_1:away_on_7, event_idx, game_id, period) %>% 
+  remove_empty("cols")
+
+# Pivot to change level of observation: one row per event to one row per player
+
+player <- powerplay %>% 
+  mutate(PP_1 = ifelse(PP_team == home_abbreviation, home_on_1, away_on_1),
+         PP_2 = ifelse(PP_team == home_abbreviation, home_on_2, away_on_2),
+         PP_3 = ifelse(PP_team == home_abbreviation, home_on_3, away_on_3),
+         PP_4 = ifelse(PP_team == home_abbreviation, home_on_4, away_on_4),
+         PP_5 = ifelse(PP_team == home_abbreviation, home_on_5, away_on_5)) %>% 
+  select(game_id, event_idx, contains("PP"), length) %>% 
+  pivot_longer(PP_1:PP_5, values_to = "player")
+
+position <- roster %>% 
+  select(player, position) %>% 
+  unique()
+
+position %>% 
+  get_dupes(player)
+
+position <- position %>% 
+  filter(!(player == "Sebastian Aho" & position == "D"))
+
+position <- position %>% 
+  mutate(player = str_replace_all(player, " ", "."),
+         player = str_replace_all(player, "-", "."),
+         player = str_replace_all(player, "'", "."))
+
+# See who the mismatches are and fix
+
+player %>% 
+  left_join(position, by = "player") %>% 
+  filter(is.na(position)) %>% 
+  select(player) %>% 
+  unique()
+
+position <- position %>% 
+  mutate(player = case_when(player == "Joshua.Norris" ~ "Josh.Norris",
+                            player == "Mitch.Marner" ~ "Mitchell.Marner",
+                            player == "Callan.Foote" ~ "Cal.Foote",
+                            player == "Nicholas.Caamano" ~ "Nick.Caamano",
+                            player == "Alexander.Wennberg" ~ "Alex.Wennberg",
+                            player == "Dominik.Kubalík" ~ "Dominik.Kubalik",
+                            player == "Mathew.Dumba" ~ "Matt.Dumba",
+                            TRUE ~ player))
+
+
+# Join in the position data to the player-level data and create a 0/1 variable for forwards
+
+player <- player %>% 
+  left_join(position, by = "player") %>% 
+  mutate(forward = ifelse(str_detect(position, "D"), 0, 1))
+
+# Aggregate data to find the position structure breakdown for each team
+
+fwd <- player %>% 
+  # group the data by event
+  group_by(game_id, event_idx, PP_team) %>% 
+  summarize(fwds = sum(forward),
+            length = mean(length)) %>% 
+  # group again by position structure and team
+  group_by(PP_team, fwds) %>% 
+  summarize(time = sum(length)) %>% 
+  # add the total time to serve as denominator
+  add_tally(time, n = "total_time") %>% 
+  # calculate the percentage
+  mutate(perc = time / total_time) %>% 
+  # filter to our group of interest
+  filter(fwds == 4)
+
+```
+# 2. Visualizations----
+```{r}
+
+# Get the team logo data from hockeyR and join in the team logo and main team color
+
+logos <- team_logos_colors
+
+fwd <- fwd %>% 
+  left_join(select(logos, team_abbr, team_logo_espn, team_color1), by = c("PP_team" = "team_abbr"))
+
+# Creating a table with gt
+
+fwd %>% 
+  ungroup() %>% 
+  select(team_logo_espn, perc) %>% 
+  arrange(desc(perc)) %>% 
+  gt() %>% 
+  tab_header(title = "Percentage of 5v4 Power Play Time With Four Forwards",
+             subtitle = "Draw no conclusions, this is one night of games!") %>%
+  gt_img_rows(columns = team_logo_espn, height = 25) %>% 
+  fmt_percent(perc, decimals = 0) %>% 
+  gt_color_rows(perc,
+                palette = "ggsci::blue_grey_material") %>% 
+  opt_table_font(font = google_font(name = "Ubuntu")) %>% 
+  tab_options(table.font.size = 12,
+              heading.title.font.size = 14,
+              table.width = px(250),
+              column_labels.hidden = TRUE,
+              data_row.padding = px(1),
+              table_body.hlines.width = 0,
+              table.border.top.color = 'black',
+              table.border.top.width = 2,
+              heading.border.bottom.color = 'black',
+              heading.border.bottom.width = 2,
+              table_body.border.bottom.color = 'black',
+              table_body.border.bottom.width = 2)
+
+
+# Creating a bar graph with ggplot2
+
+fwd %>% 
+  ggplot(aes(x = perc, y = reorder(PP_team, perc))) +
+  geom_bar(stat = "identity", fill = fwd$team_color1) +
+  scale_x_continuous(label = scales::percent,
+                     expand = expansion(mult = c(0, 0.05))) +
+  labs(x = NULL, y = NULL,
+       title = "Percentage of 5v4 power play time with four forwards",
+       subtitle = "Games on Feb. 27, 2021") +
+  theme_linedraw() +
+  theme(plot.title.position = "plot")
+
+# Filtering to power play goals and shots on goal only
+
+PP_shots <- powerplay %>% 
+  filter(event_type %in% c("SHOT","GOAL") & event_team_abbr == PP_team) %>% 
+  mutate(x_rotate = ifelse(x > 0, x * -1, x),
+         y_rotate = ifelse(x > 0, y * -1, y)) %>% 
+  arrange(desc(event_type))
+
+
+geom_hockey("nhl", full_surf = FALSE) +
+  geom_point(data = PP_shots, aes(x = x_rotate, y = y_rotate),
+             size = 6,
+             color = ifelse(PP_shots$event_type == "GOAL", "#661414", "#A9A9A9"),
+             alpha = ifelse(PP_shots$event_type == "GOAL", 1, 0.5)) +
+  labs(title = "Shots and <span style = 'color:#661414;'>**goals**</span> on the 5v4 power play",
+       subtitle = "On the night of February 27, 2021",
+       caption = "Data from hockeyR & plot made with sportyR by @MeghanMHall") +
+  theme(plot.title = element_markdown(hjust = 0.5, vjust = 0.5, size = 16),
+        plot.subtitle = element_text(hjust = 0.5, face = "italic"),
+        plot.caption = element_text(hjust = 0.5))
+
+
+
+
+#working with 2020 skaters - loaded from skaters.csv, filtered to >9 games
+names(nhl20)[names(nhl20) == 'I_F_xGoals'] <- "xG"
+names(nhl20)[names(nhl20) == 'I_F_goals'] <- "goals"
+
+#assign conferences to each team
+nhl20 <- nhl20 %>% mutate(conf = case_when((team == "FLA" | team == "TOR" | team == "T.B" | team == "DET" | team == "BUF" | team == "BOS" | team == "MTL" | team == "OTT")~'ATL',
+                                            (team == "WSH" | team == "NYR" | team == "CAR" | team == "PIT" | team == "CBJ" | team == "N.J" | team == "PHI" | team == "NYI")~'MET',
+                                            (team == "MIN" | team == "STL" | team == "DAL" | team == "WPG" | team == "COL" | team == "NSH" | team == "CHI" | team == "ARI")~'CEN',
+                                            (team == "CGY" | team == "EDM" | team == "ANA" | team == "S.J" | team == "VGK" | team == "L.A" | team == "SEA" | team == "VAN")~'PAC'
+                                          )
+                          )
+
+ggplot(data=nhl20, aes(x=xG, group=conf, fill=conf)) +
+  geom_density(adjust=1.5) +
+  theme_ipsum() +
+  facet_wrap(~conf) +
+  theme(
+    legend.position="none",
+    panel.spacing = unit(0.1, "lines"),
+    axis.ticks.x=element_blank()
+  )
+
+
+p1<-ggplot(data=nhl20, aes(x=xG, y = goals, color = position)) +
+  geom_point() +
+  facet_wrap(~conf)+
+    theme(
+    legend.position="none",
+    panel.spacing = unit(0.1, "lines"),
+    axis.ticks.x=element_blank()
+  )
+p3 <- ggMarginal(p, type = "boxplot") 
+
+                                 
+```
+
+#trying xG model
+```{r}
+pbp22 <- load_pbp('2021-22')
+
+fenwick_events <- c("SHOT", "MISSED_SHOT", "GOAL")
+shots <- pbp22 %>% filter(event_type %in% fenwick_events)
+
+shots$line = if_else(shots$shot_distance > 100, "over", "in" )
+filter(shots, event_type == "GOAL" & strength_state == "5v5") %>% ggplot(aes(x = x, y = y, color = line)) + geom_point()
+
+v55 <- shots %>% filter(strength_state == "5v5") %>% group_by(x, y) %>% summarise(FS = sum(event_type == "GOAL")/ n(),                             n = n())
+
+v55 %>% filter(n > 4) %>% ggplot(aes(x = n, y = FS)) + geom_point()
+
+v55 %>% filter(n > 10) %>% ggplot(aes(x = x, y = y, color = FS)) + geom_point() + scale_color_distiller(palette = 4, direction = -1)
+
+
+ggplot(shots, aes(x=x, y=y) ) +
+  stat_density_2d(aes(fill = ..density..), geom = "raster", contour = FALSE) +
+  scale_fill_distiller(palette=4)
+
+geom_hockey("nhl") + geom_point(data = filter(v55, n > 10), aes(x = x, y = y, color = FS)) + scale_color_distiller(palette = 4, direction = 1)
+
+
+```
+
+#counting points in grid
+```{r}
+# x -100 to 100, y: -45 to 45
+#counting? https://stackoverflow.com/questions/20998063/r-counting-points-on-a-grid-of-rectangles
+
+x <- seq(-100,100,by=5)
+y <- seq(-45, 45, by=5)
+grid <- expand.grid(x, y)
+#N <- 100
+#points <- cbind(runif(N, 0, 10), runif(N, 0, 30))
+points <- cbind(shots$x, shots$y)
+#plot(grid, t="n", xaxs="i", yaxs="i")
+#points(points, col="blue", pch="+") 
+#abline(v=x, h=y)
+
+binxy <- data.frame(x=findInterval(points[,1], x),
+                    y=findInterval(points[,2], y))
+
+(results <- table(binxy))
+d <- as.data.frame.table(results)
+xx <- x[-length(x)] + 0.5*diff(x)
+d$x <- xx[d$x]
+yy <- y[-length(y)] + 0.5*diff(y)
+d$y <- yy[d$y]
+#with(d, text(x, y, label=Freq))
+
+#same counting as above, but just for goals, then join dataframes to get percentages
+
+goals <- shots %>% filter(event_type == "GOAL")
+gpoints <- cbind(goals$x, goals$y)
+gbinxy <- data.frame(x=findInterval(gpoints[,1], x),
+                    y=findInterval(gpoints[,2], y))
+
+(gresults <- table(gbinxy))
+gd <- as.data.frame.table(gresults)
+
+gd <- rename(gd, gFreq = Freq)
+
+d$gFreq = gd$gFreq
+
+d$FS = d$gFreq / d$Freq
+xx <- x[-length(x)] + 0.5*diff(x)
+d$x <- xx[d$x]
+yy <- y[-length(y)] + 0.5*diff(y)
+d$y <- yy[d$y]
+
+summary(d$Freq)
+d %>% ggplot(aes(x = Freq)) + geom_histogram(binwidth = 25)
+#lots of squares with 50 or less shots
+
+d %>% ggplot(aes(x = x, y = y, color = FS, size = Freq)) + geom_point()
+
+
+#graph on ice
+allgoals <- geom_hockey("nhl") + 
+  geom_point(data = filter(d, Freq > 50), 
+             aes(x = x, y = y, 
+                 color = FS, 
+                 size = Freq)
+                 ) + 
+  scale_color_distiller(palette = "YlOrRd", direction = 1) +
+  labs(title = "NHL Shots, Scoring Rate and Frequency, 2021-22",
+       subtitle = "(n > 50)",
+       caption = "@jmeerse  data: HockeyR and SportyR",
+       color = "Goal %",
+       size = "Number of Shots"
+       )
+
+allgoals
+
+#trying 5v5 again
+shots5 <- shots %>% filter(strength_state == "5v5") 
+x5 <- seq(-100,100,by=5)
+y5 <- seq(-45, 45, by=5)
+grid5 <- expand.grid(x5, y5)
+
+points5 <- cbind(shots5$x, shots5$y)
+
+binxy5 <- data.frame(x=findInterval(points5[,1], x5),
+                    y=findInterval(points5[,2], y5))
+
+(results5 <- table(binxy5))
+d5 <- as.data.frame.table(results5)
+xx5 <- x[-length(x)] + 0.5*diff(x)
+d5$x <- xx5[d5$x]
+yy5 <- y[-length(y)] + 0.5*diff(y)
+d5$y <- yy5[d5$y]
+#with(d, text(x, y, label=Freq))
+
+#same counting as above, but just for goals, then join dataframes to get percentages
+
+goals5 <- shots5 %>% filter(event_type == "GOAL")
+gpoints5 <- cbind(goals5$x, goals5$y)
+gbinxy5 <- data.frame(x=findInterval(gpoints5[,1], x5),
+                    y=findInterval(gpoints5[,2], y5))
+
+gbinxy5[nrow(gbinxy5) + 1,] <- c(23, 1) # puts in an observation for square 23
+#something is still wierd here - maybe try a different filter
+(gresults5 <- table(gbinxy5))
+gd5 <- as.data.frame.table(gresults5)
+
+gd5 <- rename(gd5, gFreq5 = Freq)
+
+d5$gFreq = gd5$gFreq
+
+d5$FS = d5$gFreq / d5$Freq
+xx5 <- x5[-length(x5)] + 0.5*diff(x5)
+d5$x <- xx5[d5$x]
+yy5 <- y5[-length(y5)] + 0.5*diff(y5)
+d5$y <- yy5[d5$y]
+
+
+
+#graph on ice 5v5
+goals5v5 <- geom_hockey("nhl") + 
+  geom_point(data = filter(d5, Freq > 50), 
+             aes(x = x, y = y, 
+                 color = FS, 
+                 size = Freq)) + 
+  scale_color_distiller(palette = "YlOrRd", direction = 1) +
+  labs(title = "NHL Shots, Scoring Rate and Frequency, 5v5, 2021-22",
+       subtitle = "(n > 50)",
+       caption = "@jmeerse  data: HockeyR and SportyR",
+       color = "Goal %",
+       size = "Number of Shots")
+
+bigdata <- left_join(d, d5, by = c("x", "y"))
+#look at difference in FS by all vs 5v5
+```
